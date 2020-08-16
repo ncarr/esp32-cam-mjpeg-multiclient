@@ -25,7 +25,9 @@
 #define PRO_CPU 0
 
 #include "src/OV2640.h"
+#include <Wire.h>
 #include <WiFi.h>
+#include <ArduinoMqttClient.h>
 #include <WebServer.h>
 #include <WiFiClient.h>
 
@@ -36,10 +38,11 @@
 
 // Select camera model
 //#define CAMERA_MODEL_WROVER_KIT
-#define CAMERA_MODEL_ESP_EYE
+//#define CAMERA_MODEL_ESP_EYE
 //#define CAMERA_MODEL_M5STACK_PSRAM
 //#define CAMERA_MODEL_M5STACK_WIDE
 //#define CAMERA_MODEL_AI_THINKER
+#define CAMERA_MODEL_TTGO_T_CAMERA_V17
 
 #include "camera_pins.h"
 
@@ -48,18 +51,45 @@ Next one is an include with wifi credentials.
 This is what you need to do:
 
 1. Create a file called "home_wifi_multi.h" in the same folder   OR   under a separate subfolder of the "libraries" folder of Arduino IDE. (You are creating a "fake" library really - I called it "MySettings"). 
-2. Place the following text in the file:
+2. Place the following text in the file (replace with your wifi config and ip addresses):
 #define SSID1 "replace with your wifi ssid"
 #define PWD1 "replace your wifi password"
+
+#define LOCAL_IP IPAddress(192, 168, 0, 3)
+#define GATEWAY_IP IPAddress(192, 168, 0, 1)
+#define SUBNET_MASK IPAddress(255, 255, 255, 0)
+#define PRIMARY_DNS IPAddress(8, 8, 8, 8)
+
+#define MQTT_SERVER "192.168.0.4"
 3. Save.
 
 Should work then
 */
 #include "home_wifi_multi.h"
 
+#define VIDEO_LENGTH_MS 30000
+
+WiFiClient wifiClient;
+MqttClient mqttClient(wifiClient);
+
+
+#include "SSD1306.h"
+#define OLED_ADDRESS 0x3c
+#define I2C_SDA 21
+#define I2C_SCL 22
+SSD1306Wire display(OLED_ADDRESS, I2C_SDA, I2C_SCL, GEOMETRY_128_64);
+bool hasDisplay; // we probe for the device at runtime
+
+#include "KarlaBold16.h"
+#include "KarlaBold24.h"
+
 OV2640 cam;
 
 WebServer server(80);
+
+unsigned long currentTime = millis();
+unsigned long shutoffTime = millis() + VIDEO_LENGTH_MS;
+unsigned long lastMotion = millis();
 
 // ===== rtos task handles =========================
 // Streaming is implemented with 3 tasks:
@@ -382,11 +412,32 @@ void handleNotFound()
 // ==== SETUP method ==================================================================
 void setup()
 {
-
   // Setup Serial connection:
   Serial.begin(115200);
-  delay(1000); // wait for a second to let Serial connect
+  Wire.begin(I2C_SDA, I2C_SCL);
 
+  
+  hasDisplay = display.init();
+  if(hasDisplay) {
+      display.setFont(Karla_Bold_24);
+      display.setTextAlignment(TEXT_ALIGN_CENTER);
+      display.clear();
+      display.drawString(64, 32, "Connecting");
+      display.display();
+  }
+
+  Wire.begin(I2C_SDA, I2C_SCL);
+#define IP5306_ADDR 0X75
+#define IP5306_REG_SYS_CTL0 0x00
+  bool en = true;
+  Wire.beginTransmission(IP5306_ADDR);
+  Wire.write(IP5306_REG_SYS_CTL0);
+  if (en)
+    Wire.write(0x37); // Set bit1: 1 enable 0 disable boost keep on
+  else
+    Wire.write(0x35); // 0x37 is default reg value
+
+  pinMode(AS312_PIN, INPUT);
 
   // Configure the camera
   camera_config_t config;
@@ -415,7 +466,7 @@ void setup()
   //  config.frame_size = FRAMESIZE_UXGA;
   //  config.frame_size = FRAMESIZE_SVGA;
   //  config.frame_size = FRAMESIZE_QVGA;
-  config.frame_size = FRAMESIZE_VGA;
+  config.frame_size = FRAMESIZE_SVGA;
   config.jpeg_quality = 12;
   config.fb_count = 2;
 
@@ -425,10 +476,15 @@ void setup()
 #endif
 
   if (cam.init(config) != ESP_OK) {
-    Serial.println("Error initializing the camera");
-    delay(10000);
-    ESP.restart();
+    Serial.println("Error initializing the camera. Sleeping");
+    display.displayOff();
+    Serial.println("Sleeping");
+    esp_sleep_enable_ext1_wakeup(((uint64_t)(((uint64_t)1) << AS312_PIN)), ESP_EXT1_WAKEUP_ANY_HIGH);
+    esp_deep_sleep_start();
   }
+    
+    sensor_t *s = esp_camera_sensor_get();
+    s->set_vflip(s, 1);
 
 
   //  Configure and connect to WiFi
@@ -436,15 +492,37 @@ void setup()
 
   WiFi.mode(WIFI_STA);
   WiFi.begin(SSID1, PWD1);
+  WiFi.config(LOCAL_IP, GATEWAY_IP, SUBNET_MASK, PRIMARY_DNS);
   Serial.print("Connecting to WiFi");
+  shutoffTime = millis() + VIDEO_LENGTH_MS;
   while (WiFi.status() != WL_CONNECTED)
   {
     delay(500);
     Serial.print(F("."));
+    if (millis() > shutoffTime) {
+      display.displayOff();
+      Serial.println("Connection failed. Sleeping");
+      esp_sleep_enable_ext1_wakeup(((uint64_t)(((uint64_t)1) << AS312_PIN)), ESP_EXT1_WAKEUP_ANY_HIGH);
+      esp_deep_sleep_start();
+    }
   }
   ip = WiFi.localIP();
   Serial.println(F("WiFi connected"));
   Serial.println("");
+  display.clear();
+  display.drawString(64, 32, "Recording");
+  display.fillCircle(64, 16, 8);
+  display.display();
+  if (!mqttClient.connect(MQTT_SERVER, 1883)) {
+    Serial.print("MQTT connection failed! Error code = ");
+    Serial.println(mqttClient.connectError());
+  }
+  mqttClient.onMessage(onMqttMessage);
+  mqttClient.subscribe("camera/doorbell/keepalive");
+  mqttClient.subscribe("camera/doorbell/message");
+  mqttClient.beginMessage("camera/doorbell/available");
+  mqttClient.print("ON");
+  mqttClient.endMessage();
   Serial.print("Stream Link: http://");
   Serial.print(ip);
   Serial.println("/mjpeg/1");
@@ -461,12 +539,56 @@ void setup()
     APP_CPU);
 }
 
-
 void loop() {
+  currentTime = millis();
+  mqttClient.poll();
+  if (digitalRead(AS312_PIN) && currentTime > lastMotion + 2000) {
+    lastMotion = currentTime;
+    shutoffTime = currentTime + VIDEO_LENGTH_MS;
+    mqttClient.beginMessage("camera/doorbell/available");
+    mqttClient.print("ON");
+    mqttClient.endMessage();
+  }
+  if (currentTime > shutoffTime) {
+    mqttClient.beginMessage("camera/doorbell/available");
+    mqttClient.print("OFF");
+    mqttClient.endMessage();
+    display.displayOff();
+    Serial.println("Sleeping");
+    esp_sleep_enable_ext1_wakeup(((uint64_t)(((uint64_t)1) << AS312_PIN)), ESP_EXT1_WAKEUP_ANY_HIGH);
+    esp_deep_sleep_start();
+  }
   // loop() runs in the RTOS Idle Task.
   // If loop has a chance to run, there is nothing else for the CPU to do
   // so we can nap for 1 ms
 
 //  esp_sleep_enable_timer_wakeup((uint64_t) 1000);
 //  esp_light_sleep_start();
+}
+
+void onMqttMessage(int messageSize) {
+  String topic = mqttClient.messageTopic();
+  String content;
+  while (mqttClient.available()) {
+    content += (char) mqttClient.read();
+  }
+  if (topic == "camera/doorbell/message") {
+    display.clear();
+    if (messageSize > 0) {
+      display.setFont(Karla_Bold_16);
+      display.setTextAlignment(TEXT_ALIGN_LEFT);
+      display.fillRect(0, 0, 128, 64);
+      display.setColor(BLACK);
+      display.drawStringMaxWidth(5, 5, 118, content);
+      display.setColor(WHITE);
+    } else {
+      display.setFont(Karla_Bold_24);
+      display.setTextAlignment(TEXT_ALIGN_CENTER);
+      display.drawString(64, 32, "Recording");
+      display.fillCircle(64, 16, 8);
+    }
+    display.display();
+  }
+  Serial.println("Wake time extended");
+  shutoffTime = currentTime + VIDEO_LENGTH_MS;
 }
