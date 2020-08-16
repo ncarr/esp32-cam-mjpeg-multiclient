@@ -47,23 +47,23 @@
 #include "camera_pins.h"
 
 /*
-Next one is an include with wifi credentials.
-This is what you need to do:
+  Next one is an include with wifi credentials.
+  This is what you need to do:
 
-1. Create a file called "home_wifi_multi.h" in the same folder   OR   under a separate subfolder of the "libraries" folder of Arduino IDE. (You are creating a "fake" library really - I called it "MySettings"). 
-2. Place the following text in the file (replace with your wifi config and ip addresses):
-#define SSID1 "replace with your wifi ssid"
-#define PWD1 "replace your wifi password"
+  1. Create a file called "home_wifi_multi.h" in the same folder   OR   under a separate subfolder of the "libraries" folder of Arduino IDE. (You are creating a "fake" library really - I called it "MySettings"). 
+  2. Place the following text in the file (replace with your wifi config and ip addresses):
+  #define SSID1 "replace with your wifi ssid"
+  #define PWD1 "replace your wifi password"
 
-#define LOCAL_IP IPAddress(192, 168, 0, 3)
-#define GATEWAY_IP IPAddress(192, 168, 0, 1)
-#define SUBNET_MASK IPAddress(255, 255, 255, 0)
-#define PRIMARY_DNS IPAddress(8, 8, 8, 8)
+  #define LOCAL_IP IPAddress(192, 168, 0, 3)
+  #define GATEWAY_IP IPAddress(192, 168, 0, 1)
+  #define SUBNET_MASK IPAddress(255, 255, 255, 0)
+  #define PRIMARY_DNS IPAddress(8, 8, 8, 8)
 
-#define MQTT_SERVER "192.168.0.4"
-3. Save.
+  #define MQTT_SERVER "192.168.0.4"
+  3. Save.
 
-Should work then
+  Should work then
 */
 #include "home_wifi_multi.h"
 
@@ -104,10 +104,10 @@ SemaphoreHandle_t frameSync = NULL;
 QueueHandle_t streamingClients;
 
 // We will try to achieve 25 FPS frame rate
-const int FPS = 25;
+const int FPS = 14;
 
 // We will handle web client requests every 50 ms (20 Hz)
-const int WSINTERVAL = 50;
+const int WSINTERVAL = 100;
 
 
 // ======== Server Connection Handler Task ==========================
@@ -138,7 +138,7 @@ void mjpegCB(void* pvParameters) {
   xTaskCreatePinnedToCore(
     streamCB,
     "strmCB",
-    4096,
+    4 * 1024,
     NULL, //(void*) handler,
     2,
     &tStream,
@@ -213,11 +213,12 @@ void camCB(void* pvParameters) {
     xSemaphoreTake( frameSync, portMAX_DELAY );
 
     //  Do not allow interrupts while switching the current frame
-    taskENTER_CRITICAL(&xSemaphore);
+    portENTER_CRITICAL(&xSemaphore);
     camBuf = fbs[ifb];
     camSize = s;
-    ifb = (++ifb) & 1;  // this should produce 1, 0, 1, 0, 1 ... sequence
-    taskEXIT_CRITICAL(&xSemaphore);
+    ifb++;
+    ifb &= 1;  // this should produce 1, 0, 1, 0, 1 ... sequence
+    portEXIT_CRITICAL(&xSemaphore);
 
     //  Let anyone waiting for a frame know that the frame is ready
     xSemaphoreGive( frameSync );
@@ -388,6 +389,7 @@ void handleJPG(void)
   WiFiClient client = server.client();
 
   if (!client.connected()) return;
+  cam.run();
   client.write(JHEADER, jhdLen);
   client.write((char*)cam.getfb(), cam.getSize());
 }
@@ -532,7 +534,7 @@ void setup()
   xTaskCreatePinnedToCore(
     mjpegCB,
     "mjpeg",
-    4096,
+    4 * 1024,
     NULL,
     2,
     &tMjpeg,
@@ -558,12 +560,8 @@ void loop() {
     esp_sleep_enable_ext1_wakeup(((uint64_t)(((uint64_t)1) << AS312_PIN)), ESP_EXT1_WAKEUP_ANY_HIGH);
     esp_deep_sleep_start();
   }
-  // loop() runs in the RTOS Idle Task.
-  // If loop has a chance to run, there is nothing else for the CPU to do
-  // so we can nap for 1 ms
-
-//  esp_sleep_enable_timer_wakeup((uint64_t) 1000);
-//  esp_light_sleep_start();
+  
+  vTaskDelay(1000);
 }
 
 void onMqttMessage(int messageSize) {
